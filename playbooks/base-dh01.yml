@@ -1,0 +1,249 @@
+---
+- name: Bootstrap base-dh01 (static IP, domain join, docker group)
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    target_hostname: "base-dh01"
+
+    target_ip: "192.168.20.41"
+    target_prefix: "24"
+    target_gw: "192.168.20.254"
+
+    dns_servers:
+      - "192.168.6.231"
+      - "192.168.20.231"
+    dns_search:
+      - "corp.base.pl"
+
+    domain_fqdn: "corp.base.pl"
+    domain_join_user: "rs_rl"          # user do join
+    domain_join_password: "{{ vault_domain_join_password }}"  # PODAJESZ JAKO SECRET/EXTRA VAR (patrz niżej)
+
+    # Grupy AD (zakładamy short names w sssd)
+    ssh_allowed_group: "ztc_linuxuser"
+    sudo_admin_group: "ztc_linuxadmin"
+    docker_manage_group: "ztc_docker"
+
+    netplan_iface: "eth0"
+    netplan_file: "/etc/netplan/00-static.yaml"
+
+  pre_tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install base packages for domain join
+      ansible.builtin.apt:
+        name:
+          - realmd
+          - sssd
+          - sssd-tools
+          - adcli
+          - oddjob
+          - oddjob-mkhomedir
+          - samba-common-bin
+          - packagekit
+          - chrony
+        state: present
+
+    - name: Full upgrade (optional but recommended)
+      ansible.builtin.apt:
+        upgrade: dist
+
+  tasks:
+    - name: Set hostname
+      ansible.builtin.hostname:
+        name: "{{ target_hostname }}"
+
+    - name: Ensure /etc/hosts has 127.0.1.1 hostname entry
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.1\.1\s+'
+        line: "127.0.1.1 {{ target_hostname }}"
+        create: false
+
+    - name: Write netplan static config
+      ansible.builtin.copy:
+        dest: "{{ netplan_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          network:
+            version: 2
+            ethernets:
+              {{ netplan_iface }}:
+                addresses:
+                  - {{ target_ip }}/{{ target_prefix }}
+                routes:
+                  - to: default
+                    via: {{ target_gw }}
+                nameservers:
+                  addresses:
+          {% for d in dns_servers %}
+                    - {{ d }}
+          {% endfor %}
+                  search:
+          {% for s in dns_search %}
+                    - {{ s }}
+          {% endfor %}
+
+    - name: Remove DHCP netplan if exists
+      ansible.builtin.file:
+        path: /etc/netplan/00-dhcp.yaml
+        state: absent
+
+    - name: Apply netplan (may drop SSH) and reboot
+      block:
+        - name: Try netplan apply
+          ansible.builtin.command: netplan apply
+          changed_when: true
+
+        - name: Reboot after network change
+          ansible.builtin.reboot:
+            reboot_timeout: 600
+            pre_reboot_delay: 2
+      rescue:
+        # Jeśli połączenie padnie “w trakcie”, i tak przejdziemy do wait_for z localhost
+        - name: Force reboot (best effort)
+          ansible.builtin.command: shutdown -r now "Reboot after netplan change"
+          async: 1
+          poll: 0
+          ignore_errors: true
+
+    - name: Wait for SSH on new IP
+      ansible.builtin.wait_for:
+        host: "{{ target_ip }}"
+        port: 22
+        timeout: 600
+      delegate_to: localhost
+
+    - name: Switch Ansible to new IP and reset connection
+      ansible.builtin.set_fact:
+        ansible_host: "{{ target_ip }}"
+
+    - name: Reset SSH connection
+      ansible.builtin.meta: reset_connection
+
+    # ---- DOMAIN JOIN ----
+    - name: Ensure oddjobd is enabled (mkhomedir)
+      ansible.builtin.service:
+        name: oddjobd
+        state: started
+        enabled: true
+
+    - name: Discover realm
+      ansible.builtin.command: "realm discover {{ domain_fqdn }}"
+      changed_when: false
+
+    - name: Join domain (idempotent)
+      ansible.builtin.shell: |
+        set -e
+        if realm list | grep -qi "^{{ domain_fqdn }}$"; then
+          echo "Already joined"
+          exit 0
+        fi
+        echo '{{ domain_join_password }}' | realm join --user='{{ domain_join_user }}' {{ domain_fqdn }}
+      args:
+        executable: /bin/bash
+      no_log: true
+
+    - name: Configure SSSD to use short names (no fqdn in usernames)
+      ansible.builtin.lineinfile:
+        path: /etc/sssd/sssd.conf
+        regexp: '^use_fully_qualified_names\s*='
+        line: 'use_fully_qualified_names = False'
+      notify: restart sssd
+
+    - name: Ensure mkhomedir enabled in PAM (via oddjob-mkhomedir)
+      ansible.builtin.command: pam-auth-update --enable mkhomedir
+      changed_when: false
+      failed_when: false
+
+    # ---- ACCESS CONTROL ----
+    - name: Restrict SSH to allowed AD group
+      ansible.builtin.blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} ANSIBLE MANAGED (GROUP ACCESS)"
+        block: |
+          AllowGroups {{ ssh_allowed_group }} {{ sudo_admin_group }} {{ docker_manage_group }}
+      notify: restart ssh
+
+    - name: Sudo for AD admin group
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/010-ztc-linuxadmin
+        owner: root
+        group: root
+        mode: "0440"
+        content: |
+          %{{ sudo_admin_group }} ALL=(ALL) ALL
+
+    # ---- DOCKER INSTALL + AD GROUP WITHOUT SUDO ----
+    - name: Install Docker dependencies
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+
+    - name: Add Docker GPG key
+      ansible.builtin.shell: |
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: Add Docker repo
+      ansible.builtin.apt_repository:
+        repo: "deb [arch={{ ansible_architecture }} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable"
+        state: present
+      register: docker_repo
+
+    - name: Install Docker Engine + compose plugin
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: "{{ docker_repo.changed }}"
+
+    - name: Configure dockerd to use AD group for docker socket (no sudo)
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {
+            "group": "{{ docker_manage_group }}"
+          }
+      notify: restart docker
+
+    - name: Enable and start docker
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+  handlers:
+    - name: restart sssd
+      ansible.builtin.service:
+        name: sssd
+        state: restarted
+
+    - name: restart ssh
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
+    - name: restart docker
+      ansible.builtin.service:
+        name: docker
+        state: restarted
