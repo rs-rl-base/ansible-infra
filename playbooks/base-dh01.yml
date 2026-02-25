@@ -98,30 +98,34 @@
         path: /etc/netplan/00-dhcp.yaml
         state: absent
 
-    - name: Apply netplan (may drop SSH) and reboot
-      block:
-        - name: Try netplan apply
-          ansible.builtin.command: netplan apply
-          changed_when: true
+    - name: Apply netplan (may drop SSH)
+      ansible.builtin.command: netplan apply
+      async: 60
+      poll: 0
+      changed_when: true
 
-        - name: Reboot after network change
-          ansible.builtin.reboot:
-            reboot_timeout: 600
-            pre_reboot_delay: 2
-      rescue:
-        # Jeśli połączenie padnie “w trakcie”, i tak przejdziemy do wait_for z localhost
-        - name: Force reboot (best effort)
-          ansible.builtin.command: shutdown -r now "Reboot after netplan change"
-          async: 1
-          poll: 0
-          ignore_errors: true
+    - name: Switch Ansible connection to new IP
+      ansible.builtin.set_fact:
+        ansible_host: "{{ target_ip }}"
 
-    - name: Wait for SSH on new IP
-      ansible.builtin.wait_for:
-        host: "{{ target_ip }}"
-        port: 22
+    - name: Reset connection after IP change
+      meta: reset_connection
+
+    - name: Wait for SSH on new IP (Ansible connection)
+      ansible.builtin.wait_for_connection:
         timeout: 600
-      delegate_to: localhost
+
+    - name: Reboot after network change (optional)
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+        pre_reboot_delay: 2
+
+    - name: Reset connection after reboot
+      meta: reset_connection
+
+    - name: Wait for connection after reboot
+      ansible.builtin.wait_for_connection:
+        timeout: 600
 
     - name: Switch Ansible to new IP and reset connection
       ansible.builtin.set_fact:
