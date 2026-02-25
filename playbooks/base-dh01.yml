@@ -7,10 +7,10 @@
   gather_facts: true
 
   vars:
+    # --- TARGET ---
     target_hostname: "base-dh01"
-
     target_ip: "192.168.20.41"
-    target_prefix: "24"
+    target_prefix: 24
     target_gw: "192.168.20.254"
 
     dns_servers:
@@ -19,25 +19,36 @@
     dns_search:
       - "corp.base.pl"
 
-    domain_fqdn: "corp.base.pl"
-    domain_join_user: "rs_rl"          # user do join
-    domain_join_password: "{{ vault_domain_join_password }}"  # PODAJESZ JAKO SECRET/EXTRA VAR (patrz niżej)
+    timezone_name: "Europe/Warsaw"
 
-    # Grupy AD (zakładamy short names w sssd)
+    # --- DOMAIN ---
+    domain_fqdn: "corp.base.pl"
+    domain_join_user: "rs_rl"                # user do join
+    # Podajesz w Semaphore jako Secret Extra Var:
+    # ad_join_password: "..."
+    ad_join_password: "{{ ad_join_password | default(omit) }}"
+
+    # --- GROUPS (AD) ---
     ssh_allowed_group: "ztc_linuxuser"
     sudo_admin_group: "ztc_linuxadmin"
     docker_manage_group: "ztc_docker"
 
+    # --- NETPLAN ---
     netplan_iface: "eth0"
     netplan_file: "/etc/netplan/00-static.yaml"
+    dhcp_netplan_file: "/etc/netplan/00-dhcp.yaml"
 
   pre_tasks:
+    - name: Ensure timezone (important for Kerberos/realm join)
+      ansible.builtin.command: "timedatectl set-timezone {{ timezone_name }}"
+      changed_when: false
+
     - name: Update apt cache
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 3600
 
-    - name: Install base packages for domain join
+    - name: Install packages for domain join + tools
       ansible.builtin.apt:
         name:
           - realmd
@@ -49,13 +60,23 @@
           - samba-common-bin
           - packagekit
           - chrony
+          - dnsutils
+          - curl
+          - ca-certificates
+          - gnupg
+          - lsb-release
         state: present
 
-    - name: Full upgrade (optional but recommended)
-      ansible.builtin.apt:
-        upgrade: dist
+    - name: Ensure oddjobd is enabled (mkhomedir helper)
+      ansible.builtin.service:
+        name: oddjobd
+        state: started
+        enabled: true
 
   tasks:
+    # ----------------------------
+    # Hostname
+    # ----------------------------
     - name: Set hostname
       ansible.builtin.hostname:
         name: "{{ target_hostname }}"
@@ -67,6 +88,9 @@
         line: "127.0.1.1 {{ target_hostname }}"
         create: false
 
+    # ----------------------------
+    # Netplan (static) - only if changed
+    # ----------------------------
     - name: Write netplan static config
       ansible.builtin.copy:
         dest: "{{ netplan_file }}"
@@ -92,85 +116,110 @@
           {% for s in dns_search %}
                     - {{ s }}
           {% endfor %}
+      register: netplan_cfg
 
     - name: Remove DHCP netplan if exists
       ansible.builtin.file:
-        path: /etc/netplan/00-dhcp.yaml
+        path: "{{ dhcp_netplan_file }}"
         state: absent
+      register: removed_dhcp
 
-    - name: Apply netplan (may drop SSH)
+    - name: Apply netplan (may drop SSH) if config changed
       ansible.builtin.command: netplan apply
       async: 60
       poll: 0
       changed_when: true
+      when: netplan_cfg.changed or removed_dhcp.changed
 
-    - name: Switch Ansible connection to new IP
+    - name: Switch Ansible connection to target IP when netplan changed
       ansible.builtin.set_fact:
         ansible_host: "{{ target_ip }}"
+      when: netplan_cfg.changed or removed_dhcp.changed
 
     - name: Reset connection after IP change
       meta: reset_connection
+      when: netplan_cfg.changed or removed_dhcp.changed
 
-    - name: Wait for SSH on new IP (Ansible connection)
+    - name: Wait for SSH on target IP (Ansible connection)
       ansible.builtin.wait_for_connection:
         timeout: 600
+      when: netplan_cfg.changed or removed_dhcp.changed
 
-    - name: Reboot after network change (optional)
+    - name: Reboot after network change (only when changed)
       ansible.builtin.reboot:
         reboot_timeout: 600
         pre_reboot_delay: 2
+      when: netplan_cfg.changed or removed_dhcp.changed
 
     - name: Reset connection after reboot
       meta: reset_connection
+      when: netplan_cfg.changed or removed_dhcp.changed
 
     - name: Wait for connection after reboot
       ansible.builtin.wait_for_connection:
         timeout: 600
+      when: netplan_cfg.changed or removed_dhcp.changed
 
-    - name: Switch Ansible to new IP and reset connection
-      ansible.builtin.set_fact:
-        ansible_host: "{{ target_ip }}"
-
-    - name: Reset SSH connection
-      ansible.builtin.meta: reset_connection
-
-    # ---- DOMAIN JOIN ----
-    - name: Ensure oddjobd is enabled (mkhomedir)
-      ansible.builtin.service:
-        name: oddjobd
-        state: started
-        enabled: true
-
+    # ----------------------------
+    # Domain join (idempotent)
+    # ----------------------------
     - name: Discover realm
       ansible.builtin.command: "realm discover {{ domain_fqdn }}"
       changed_when: false
 
-    - name: Join domain (idempotent)
+    - name: Check if already joined to domain
+      ansible.builtin.command: realm list
+      register: realm_list
+      changed_when: false
+      failed_when: false
+
+    - name: Join domain (only if not joined)
       ansible.builtin.shell: |
-        set -e
-        if realm list | grep -qi "^{{ domain_fqdn }}$"; then
-          echo "Already joined"
-          exit 0
-        fi
-        echo '{{ domain_join_password }}' | realm join --user='{{ domain_join_user }}' {{ domain_fqdn }}
+        set -euo pipefail
+        echo "{{ ad_join_password }}" | realm join "{{ domain_fqdn }}" --user="{{ domain_join_user }}@{{ domain_fqdn }}"
       args:
         executable: /bin/bash
+      when: realm_list.stdout is not search(domain_fqdn)
       no_log: true
 
-    - name: Configure SSSD to use short names (no fqdn in usernames)
-      ansible.builtin.lineinfile:
-        path: /etc/sssd/sssd.conf
-        regexp: '^use_fully_qualified_names\s*='
-        line: 'use_fully_qualified_names = False'
+    # ----------------------------
+    # SSSD config (short names + restrict access + sudo)
+    # ----------------------------
+    - name: Configure SSSD (short names + allow only selected groups)
+      ansible.builtin.copy:
+        dest: /etc/sssd/sssd.conf
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          [sssd]
+          domains = {{ domain_fqdn }}
+          config_file_version = 2
+          services = nss, pam, sudo
+
+          [domain/{{ domain_fqdn }}]
+          id_provider = ad
+          ad_domain = {{ domain_fqdn }}
+          krb5_realm = {{ domain_fqdn | upper }}
+          use_fully_qualified_names = False
+          fallback_homedir = /home/%u
+          default_shell = /bin/bash
+
+          access_provider = simple
+          simple_allow_groups = {{ ssh_allowed_group }},{{ sudo_admin_group }},{{ docker_manage_group }}
+
+          cache_credentials = True
       notify: restart sssd
 
-    - name: Ensure mkhomedir enabled in PAM (via oddjob-mkhomedir)
+    - name: Enable mkhomedir in PAM (best effort)
       ansible.builtin.command: pam-auth-update --enable mkhomedir
       changed_when: false
       failed_when: false
 
-    # ---- ACCESS CONTROL ----
-    - name: Restrict SSH to allowed AD group
+    # ----------------------------
+    # SSH access control
+    # ----------------------------
+    - name: Restrict SSH to allowed AD groups
       ansible.builtin.blockinfile:
         path: /etc/ssh/sshd_config
         marker: "# {mark} ANSIBLE MANAGED (GROUP ACCESS)"
@@ -178,6 +227,9 @@
           AllowGroups {{ ssh_allowed_group }} {{ sudo_admin_group }} {{ docker_manage_group }}
       notify: restart ssh
 
+    # ----------------------------
+    # Sudo for admin group
+    # ----------------------------
     - name: Sudo for AD admin group
       ansible.builtin.copy:
         dest: /etc/sudoers.d/010-ztc-linuxadmin
@@ -187,16 +239,10 @@
         content: |
           %{{ sudo_admin_group }} ALL=(ALL) ALL
 
-    # ---- DOCKER INSTALL + AD GROUP WITHOUT SUDO ----
-    - name: Install Docker dependencies
-      ansible.builtin.apt:
-        name:
-          - ca-certificates
-          - curl
-          - gnupg
-        state: present
-
-    - name: Add Docker GPG key
+    # ----------------------------
+    # Docker install (Docker official repo)
+    # ----------------------------
+    - name: Add Docker GPG key (once)
       ansible.builtin.shell: |
         install -m 0755 -d /etc/apt/keyrings
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -220,23 +266,69 @@
         state: present
         update_cache: "{{ docker_repo.changed }}"
 
-    - name: Configure dockerd to use AD group for docker socket (no sudo)
-      ansible.builtin.copy:
-        dest: /etc/docker/daemon.json
-        owner: root
-        group: root
-        mode: "0644"
-        content: |
-          {
-            "group": "{{ docker_manage_group }}"
-          }
-      notify: restart docker
-
     - name: Enable and start docker
       ansible.builtin.service:
         name: docker
         state: started
         enabled: true
+
+    # --- Docker "bez sudo" dla ztc_docker ---
+    # Jeśli grupa AD jest widoczna jako unix group -> ustawiamy docker.socket SocketGroup=ztc_docker
+    - name: Check if docker AD group exists as unix group
+      ansible.builtin.command: "getent group {{ docker_manage_group }}"
+      register: getent_docker_group
+      changed_when: false
+      failed_when: false
+
+    - name: Configure docker.socket to use group ztc_docker (no sudo needed)
+      when: getent_docker_group.rc == 0
+      block:
+        - name: Create systemd override dir for docker.socket
+          ansible.builtin.file:
+            path: /etc/systemd/system/docker.socket.d
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Set SocketGroup for docker.socket
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/docker.socket.d/override.conf
+            owner: root
+            group: root
+            mode: "0644"
+            content: |
+              [Socket]
+              SocketGroup={{ docker_manage_group }}
+              SocketMode=0660
+
+        - name: Reload systemd
+          ansible.builtin.command: systemctl daemon-reload
+          changed_when: true
+
+        - name: Restart docker.socket and docker
+          ansible.builtin.service:
+            name: docker.socket
+            state: restarted
+            enabled: true
+
+        - name: Restart docker service
+          ansible.builtin.service:
+            name: docker
+            state: restarted
+            enabled: true
+
+    # Fallback (gdy AD group nie mapuje się jako unix group):
+    # dajemy NOPASSWD tylko na docker, żeby spełnić "bez hasła" (ale to nadal sudo).
+    - name: Fallback sudoers for ztc_docker to manage docker without password
+      when: getent_docker_group.rc != 0
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/020-ztc-docker
+        owner: root
+        group: root
+        mode: "0440"
+        content: |
+          %{{ docker_manage_group }} ALL=(root) NOPASSWD: /usr/bin/docker, /usr/bin/docker\ *
 
   handlers:
     - name: restart sssd
